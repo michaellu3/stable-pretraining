@@ -228,6 +228,34 @@ def test_twist_loss_is_finite_for_extreme_logits_and_low_precision_inputs():
         assert torch.isfinite(loss)
 
 
+@pytest.mark.parametrize(
+    "z1, z2",
+    [
+        ([[100.0, -100.0, -100.0]], [[100.0, -100.0, -100.0]]),
+        ([[100.0, -100.0, -100.0]], [[-100.0, 100.0, -100.0]]),
+        ([[100.0, -100.0, -100.0], [-100.0, 100.0, -100.0]], None),
+    ],
+)
+def test_twist_loss_gradients_are_finite_for_saturated_logits(z1, z2):
+    # Regression: logits this far apart make the softmax underflow to exact
+    # zeros in float32. The loss values were already finite, but the
+    # derivative of the diversity entropy at a zero mean probability used to
+    # be -inf, which turned the gradient into NaN.
+    z1 = torch.tensor(z1, requires_grad=True)
+    z2 = (
+        z1.detach().clone().requires_grad_(True)
+        if z2 is None
+        else torch.tensor(z2, requires_grad=True)
+    )
+    for autocast in (False, True):
+        with torch.autocast(device_type="cpu", dtype=torch.bfloat16, enabled=autocast):
+            terms = TWISTLoss().terms(z1, z2)
+        for key, value in terms.items():
+            assert torch.isfinite(value), key
+            g1, g2 = torch.autograd.grad(value, (z1, z2), retain_graph=True)
+            assert torch.isfinite(g1).all() and torch.isfinite(g2).all(), key
+
+
 def test_twist_loss_is_exported():
     assert spt.losses.TWISTLoss is TWISTLoss
     assert "TWISTLoss" in spt.losses.__all__
@@ -444,6 +472,70 @@ def test_twist_eval_forward_returns_embedding_and_zero_loss():
     assert out.loss.item() == 0
     assert out.logits is None and out.consistency is None
     assert out.sharpness is None and out.diversity is None
+
+
+def test_twist_class_accepts_module_batch_and_stage():
+    # Regression: ``Module.training_step`` calls ``forward(batch, stage="fit")``
+    # with a batch dict, which the tensor-only signature used to reject.
+    torch.manual_seed(0)
+    model = TWIST(_encoder(), projector_dims=(16, 8))
+    v1, v2 = torch.randn(4, 3, 32, 32), torch.randn(4, 3, 32, 32)
+    labels = torch.tensor([0, 1, 2, 3])
+    batch = {
+        "views": [{"image": v1, "label": labels}, {"image": v2, "label": labels}],
+        "batch_idx": 0,
+    }
+    out = model(batch, stage="fit")
+    assert isinstance(out, dict)
+    assert out["loss"].ndim == 0 and torch.isfinite(out["loss"])
+    assert out["embedding"].shape == (8, VIT_DIM)
+    assert out["label"].tolist() == labels.tolist() * 2
+    torch.manual_seed(0)
+    torch.testing.assert_close(out["loss"], model(v1, v2).loss)
+
+    named = {"view_a": {"image": v1}, "view_b": {"image": v2}, "batch_idx": 3}
+    assert "label" not in model(named, stage="fit")
+
+    model.eval()
+    out = model({"image": v1, "label": labels}, stage="validate")
+    assert out["embedding"].shape == (4, VIT_DIM)
+    assert out["label"] is labels and out["loss"] == 0
+
+    with pytest.raises(ValueError, match="exactly 2"):
+        model({"views": [{"image": v1}]}, stage="fit")
+
+
+def test_twist_class_trains_with_a_lightning_trainer(tmp_path):
+    # Regression: the class must be usable directly as the LightningModule.
+    import lightning as pl
+
+    class _TwoViewDataset(torch.utils.data.Dataset):
+        def __len__(self):
+            return 8
+
+        def __getitem__(self, idx):
+            return {
+                "views": [
+                    {"image": torch.randn(3, 32, 32), "label": idx % 4},
+                    {"image": torch.randn(3, 32, 32), "label": idx % 4},
+                ]
+            }
+
+    model = TWIST(_encoder(), projector_dims=(16, 8))
+    model.optim = {"optimizer": {"type": "SGD", "lr": 0.01}}
+    before = [p.detach().clone() for p in model.projector.parameters()]
+    trainer = pl.Trainer(
+        fast_dev_run=True,
+        accelerator="cpu",
+        logger=False,
+        enable_checkpointing=False,
+        enable_progress_bar=False,
+        enable_model_summary=False,
+        default_root_dir=tmp_path,
+    )
+    trainer.fit(model, torch.utils.data.DataLoader(_TwoViewDataset(), batch_size=4))
+    after = list(model.projector.parameters())
+    assert any(not torch.equal(b, a) for b, a in zip(before, after))
 
 
 def test_twist_is_exported_at_top_level():

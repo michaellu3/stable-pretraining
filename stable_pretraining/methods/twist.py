@@ -53,6 +53,7 @@ class TWISTOutput(ModelOutput):
     consistency: Optional[torch.Tensor] = None
     sharpness: Optional[torch.Tensor] = None
     diversity: Optional[torch.Tensor] = None
+    label: Optional[torch.Tensor] = None
 
 
 def _build_twist_projector(
@@ -181,17 +182,29 @@ class TWIST(Module):
 
     def forward(
         self,
-        view1: torch.Tensor,
+        view1: Union[torch.Tensor, dict],
         view2: Optional[torch.Tensor] = None,
+        stage: Optional[str] = None,
     ) -> TWISTOutput:
         """Forward pass.
 
-        :param view1: First augmented view ``[B, C, H, W]``. If ``view2`` is
-            ``None``, this is treated as a single eval batch.
+        Accepts either two image tensors or the batch dict (plus ``stage``)
+        that :class:`~stable_pretraining.Module` passes from its training and
+        evaluation steps, so the class can be handed directly to a Trainer.
+
+        :param view1: First augmented view ``[B, C, H, W]``, or a batch dict
+            with ``"views"`` (two view dicts with ``"image"`` and optionally
+            ``"label"``) or a single ``"image"``. A tensor without ``view2``
+            is treated as a single eval batch.
         :param view2: Second augmented view ``[B, C, H, W]`` (training only).
-        :return: :class:`TWISTOutput` with loss, embedding, class logits and
-            the three loss terms.
+        :param stage: Lightning stage, accepted for compatibility with
+            ``Module``. The loss is computed whenever two views are given.
+        :return: :class:`TWISTOutput` with loss, embedding, class logits, the
+            three loss terms and, for batch dicts, the labels for the probes.
         """
+        if isinstance(view1, dict):
+            return self._forward_batch(view1)
+
         if view2 is None:
             embedding = self.backbone(view1)
             return TWISTOutput(
@@ -211,3 +224,22 @@ class TWIST(Module):
             sharpness=terms["sharpness"].detach(),
             diversity=terms["diversity"].detach(),
         )
+
+    def _forward_batch(self, batch: dict) -> TWISTOutput:
+        """Unpack a dataloader batch, run the forward and attach the labels."""
+        if "views" in batch:
+            views = batch["views"]
+        elif "image" in batch:
+            output = self.forward(batch["image"])
+            if "label" in batch:
+                output["label"] = batch["label"]
+            return output
+        else:
+            # Dict of named views (``batch_idx`` and other scalars are skipped).
+            views = [v for v in batch.values() if isinstance(v, dict) and "image" in v]
+        if len(views) != 2:
+            raise ValueError(f"TWIST requires exactly 2 views, got {len(views)}.")
+        output = self.forward(views[0]["image"], views[1]["image"])
+        if "label" in views[0]:
+            output["label"] = torch.cat([view["label"] for view in views], dim=0)
+        return output
